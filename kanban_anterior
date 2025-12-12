@@ -1,0 +1,1204 @@
+# -*- coding: utf-8 -*-
+"""
+Sistema de Gestão de Atividades – Kanban v1.4.12 (PT-BR)
+-------------------------------------------------------
+Ajustes focados em VALORES (R$) em toda a aplicação:
+- Helpers unificados de moeda: fmt_brl(), fmt_num_brl(), parse_money().
+- Exibição em BRL (R$ 1.234,56) nos KPIs, modal/board, PDF de evidência e exportação PDF.
+- Somatórios/consistência: usa COALESCE(total_value, quantity*unit_value) em todos os agregados.
+- Entradas aceitam "1.234,56" ou "1234.56"; parsing robusto em todos os salvamentos.
+- Correção do _owners_updated (evita acesso quando aba nova não está aberta).
+"""
+import os
+import shutil
+import sqlite3
+from datetime import datetime, date, timedelta
+from dataclasses import dataclass
+from typing import List, Dict, Optional
+import tkinter as tk
+from tkinter import ttk, messagebox, simpledialog, filedialog
+import pandas as pd
+from reportlab.lib.pagesizes import A4
+from reportlab.pdfgen import canvas
+from reportlab.lib.units import cm
+from reportlab.lib.utils import ImageReader
+from typing import List, Dict, Optional, Tuple
+
+DB_NAME = "atividades.db"
+EVID_DIR = "evidencias"
+STATUSES = ["A Fazer", "Em Progresso", "Postergado", "Concluída"]
+PRIORIDADES = ["Baixa", "Média", "Alta", "Crítica"]
+STATUS_COLORS = {"A Fazer": "#F79646", "Em Progresso": "#9BBB59", "Postergado": "#00B0F0", "Concluída": "#7F7F7F"}
+
+# -----------------------------
+# Helpers de moeda (BRL)
+# -----------------------------
+def fmt_num_brl(val: float) -> str:
+    """Formata número em estilo brasileiro: 1234.56 -> '1.234,56'."""
+    try:
+        x = float(val or 0)
+    except Exception:
+        x = 0.0
+    s = f"{x:,.2f}"  # '1,234.56'
+    return s.replace(',', 'X').replace('.', ',').replace('X', '.')
+
+def fmt_brl(val: float) -> str:
+    """Formata com prefixo 'R$ ' e estilo brasileiro."""
+    return f"R$ {fmt_num_brl(val)}"
+
+def parse_money(s: str) -> float:
+    """Converte 'R$ 1.234,56' ou '1234.56' para float (1234.56)."""
+    if s is None:
+        return 0.0
+    s = str(s).strip()
+    if not s:
+        return 0.0
+    # Remove prefixos e espaços
+    s = s.replace('R$', '').replace('r$', '').replace('R$:', '').strip()
+    # Se tiver ambos '.' e ',', assume '.' como milhar e ',' como decimal
+    try:
+        if ',' in s and '.' in s:
+            s = s.replace('.', '').replace(',', '.')
+        else:
+            s = s.replace(',', '.')
+        return float(s)
+    except Exception:
+        try:
+            return float(s)
+        except Exception:
+            return 0.0
+
+@dataclass
+class Tarefa:
+    id: int
+    titulo: str
+    descricao: str
+    responsavel: str
+    prioridade: str
+    status: str
+    conclusao: int
+    inicio: str
+    prazo: str
+    ppg: str
+    periodo: str
+    area: str
+    cc: str
+    total: float
+    quantidade: float
+    unitario: float
+
+# -----------------------------
+# Banco + Migrações
+# -----------------------------
+def get_conn():
+    return sqlite3.connect(DB_NAME)
+
+def ensure_schema():
+    os.makedirs(EVID_DIR, exist_ok=True)
+    conn = get_conn(); cur = conn.cursor()
+    cur.execute("""
+    CREATE TABLE IF NOT EXISTS tasks (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        title TEXT NOT NULL,
+        description TEXT,
+        owner TEXT,
+        priority TEXT,
+        status TEXT,
+        progress INTEGER,
+        start_date TEXT,
+        due_date TEXT,
+        tags TEXT,
+        ppg_number TEXT,
+        measurement_period TEXT,
+        area TEXT,
+        cc TEXT,
+        total_value REAL,
+        quantity REAL,
+        unit_value REAL
+    )
+    """)
+    cur.execute("""
+    CREATE TABLE IF NOT EXISTS evidence_log (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        task_id INTEGER,
+        action TEXT,
+        timestamp TEXT,
+        notes TEXT,
+        FOREIGN KEY(task_id) REFERENCES tasks(id)
+    )
+    """
+    )
+    cur.execute("""
+    CREATE TABLE IF NOT EXISTS owners (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        name TEXT UNIQUE NOT NULL,
+        email TEXT
+    )
+    """
+    )
+    # Migrações: adicionar colunas ausentes
+    cur.execute("PRAGMA table_info(tasks)")
+    existing = {row[1] for row in cur.fetchall()}
+    extras = {
+        'ppg_number': 'TEXT', 'measurement_period': 'TEXT', 'area': 'TEXT', 'cc': 'TEXT',
+        'total_value': 'REAL', 'quantity': 'REAL', 'unit_value': 'REAL'
+    }
+    for col, typ in extras.items():
+        if col not in existing:
+            try:
+                cur.execute(f"ALTER TABLE tasks ADD COLUMN {col} {typ}")
+                conn.commit()
+            except Exception:
+                pass
+    # Renomear status 'Testes' -> 'Postergado'
+    try:
+        cur.execute("UPDATE tasks SET status='Postergado' WHERE status='Testes'")
+        conn.commit()
+    except Exception:
+        pass
+    conn.close()
+
+# -----------------------------
+# Owners (Responsáveis)
+# -----------------------------
+def add_owner(name: str, email: str = ""):
+    name = name.strip(); email = email.strip()
+    if not name:
+        raise ValueError("Informe um nome de responsável.")
+    conn = get_conn(); cur = conn.cursor()
+    cur.execute("INSERT OR IGNORE INTO owners (name, email) VALUES (?, ?)", (name, email))
+    conn.commit(); conn.close()
+
+def delete_owner(name: str):
+    conn = get_conn(); cur = conn.cursor(); cur.execute("DELETE FROM owners WHERE name = ?", (name,))
+    conn.commit(); conn.close()
+
+def get_owners() -> List[str]:
+    conn = get_conn(); cur = conn.cursor(); cur.execute("SELECT name FROM owners ORDER BY name")
+    res = [r[0] for r in cur.fetchall()]; conn.close(); return res
+
+def get_owners_with_keys() -> List[Tuple[str, str]]:
+    conn = get_conn(); cur = conn.cursor(); cur.execute("SELECT name, COALESCE(person_key, email, '') FROM owners ORDER BY name")
+    res = [(r[0], r[1] or '') for r in cur.fetchall()]; conn.close(); return res
+
+def obter_colaboradores() -> List[str]:
+    owners = get_owners()
+    if owners:
+        return owners
+    conn = get_conn(); cur = conn.cursor(); cur.execute("SELECT DISTINCT owner FROM tasks WHERE owner IS NOT NULL AND owner != '' ORDER BY owner")
+    res = [r[0] for r in cur.fetchall()]; conn.close(); return res
+
+# -----------------------------
+# Helpers de consulta
+# -----------------------------
+def row_to_tarefa(row) -> Tarefa:
+    total = float(row[14] or 0.0)
+    qty = float(row[15] or 0.0)
+    unit = float(row[16]) if row[16] is not None else (total / qty if qty > 0 else 0.0)
+    return Tarefa(
+        id=row[0], titulo=row[1], descricao=row[2] or '', responsavel=row[3] or '', prioridade=row[4] or '',
+        status=row[5] or '', conclusao=int(row[6] or 0), inicio=row[7] or '', prazo=row[8] or '',
+        ppg=row[10] or '', periodo=row[11] or '', area=row[12] or '', cc=row[13] or '',
+        total=total, quantidade=qty, unitario=unit
+    )
+
+def obter_tarefa(task_id: int) -> Tarefa:
+    conn = get_conn(); cur = conn.cursor(); cur.execute("SELECT * FROM tasks WHERE id = ?", (task_id,))
+    row = cur.fetchone(); conn.close(); return row_to_tarefa(row)
+
+# -----------------------------
+# KPIs
+# -----------------------------
+def kpis_gerais() -> Dict[str, float]:
+    conn = get_conn(); cur = conn.cursor(); k = {}
+
+    # KPIs por status: contagem + soma correta
+    for st in STATUSES:
+        cur.execute(
+            """
+            SELECT COUNT(*),
+                   COALESCE(SUM(COALESCE(total_value,
+                                          COALESCE(quantity,0) * COALESCE(unit_value,0)
+                                         )
+                          ), 0)
+            FROM tasks
+            WHERE status = ?
+            """,
+            (st,)
+        )
+        c, s = cur.fetchone(); k[f"count_{st}"] = c; k[f"sum_{st}"] = float(s)
+
+    # KPIs geral
+    cur.execute(
+        """
+        SELECT COUNT(*),
+               COALESCE(SUM(COALESCE(total_value,
+                                     COALESCE(quantity,0) * COALESCE(unit_value,0)
+                                    )
+                      ), 0),
+               COALESCE(AVG(progress),0)
+        FROM tasks
+        """
+    )
+    total_count, total_sum, avg_progress = cur.fetchone()
+    k["count_total"], k["sum_total"], k["avg_progress"] = total_count, float(total_sum), float(avg_progress)
+
+    # KPIs por responsável
+    cur.execute(
+        """
+        SELECT owner,
+               COUNT(*),
+               COALESCE(SUM(COALESCE(total_value,
+                                     COALESCE(quantity,0) * COALESCE(unit_value,0)
+                                    )
+                      ), 0)
+        FROM tasks
+        GROUP BY owner
+        ORDER BY owner
+        """
+    )
+    k["por_owner"] = [(r[0], r[1], float(r[2])) for r in cur.fetchall()]
+
+    # Colaborador com mais atrasos
+    try:
+        cur.execute(
+            """
+            SELECT owner, COUNT(*)
+            FROM tasks
+            WHERE (due_date IS NOT NULL AND due_date < DATE('now'))
+              AND (status IS NULL OR status <> 'Concluída')
+            GROUP BY owner
+            ORDER BY COUNT(*) DESC, owner ASC
+            LIMIT 1
+            """
+        )
+        row = cur.fetchone()
+        k['late_top_owner'] = row[0] if row else None
+        k['late_top_count'] = int(row[1]) if row else 0
+    except Exception:
+        k['late_top_owner'] = None; k['late_top_count'] = 0
+
+    conn.close(); return k
+
+# -----------------------------
+# Evidências
+# -----------------------------
+def registrar_acao(task_id: int, acao: str, notas: str = ""):
+    conn = get_conn(); cur = conn.cursor()
+    cur.execute("INSERT INTO evidence_log (task_id, action, timestamp, notes) VALUES (?, ?, ?, ?)",
+                (task_id, acao, datetime.now().isoformat(timespec="seconds"), notas))
+    conn.commit(); conn.close()
+
+
+def copiar_arquivos_evidencia(task_id: int, caminhos: List[str]) -> List[str]:
+    destino = os.path.join(EVID_DIR, f"task_{task_id}"); os.makedirs(destino, exist_ok=True)
+    copiados = []
+    for i, p in enumerate(caminhos, start=1):
+        if not p or not os.path.exists(p):
+            continue
+        ext = os.path.splitext(p)[1].lower(); novo = os.path.join(destino, f"evid_{i}{ext if ext else ''}")
+        try:
+            shutil.copy2(p, novo); copiados.append(novo)
+        except Exception as e:
+            print("Falha ao copiar evidência:", e)
+    return copiados
+
+
+def gerar_pdf_evidencia(task_id: int, arquivos: List[str], texto: str, link: str):
+    t = obter_tarefa(task_id)
+    destino = os.path.join(EVID_DIR, f"task_{task_id}"); os.makedirs(destino, exist_ok=True)
+    arquivo_pdf = os.path.join(destino, f"evidencia_task_{t.id}.pdf")
+    c = canvas.Canvas(arquivo_pdf, pagesize=A4); w, h = A4
+
+    c.setFillColorRGB(0.24, 0.51, 0.79); c.rect(0, h - 2.5*cm, w, 2.5*cm, fill=1, stroke=0)
+    c.setFillColorRGB(1, 1, 1); c.setFont("Helvetica-Bold", 18)
+    c.drawString(2*cm, h - 1.2*cm, "Evidência de Conclusão de Atividade")
+
+    c.setFillColorRGB(0, 0, 0); c.setFont("Helvetica", 12); y = h - 3.5*cm
+    campos = [
+        f"ID: {t.id}", f"Título: {t.titulo}", f"Descrição: {t.descricao}", f"Responsável: {t.responsavel}",
+        f"Prioridade: {t.prioridade}", f"Status: {t.status}", f"% Conclusão: {t.conclusao}",
+        f"Início: {t.inicio}", f"Prazo: {t.prazo}", f"N° PPG: {t.ppg}", f"Período: {t.periodo}", f"Área: {t.area}", f"CC: {t.cc}",
+        f"Unitário: {fmt_brl(t.unitario)}", f"Qtde: {t.quantidade}", f"TOTAL: {fmt_brl(t.total)}",
+        f"Gerado em: {datetime.now().strftime('%d/%m/%Y %H:%M:%S')}"
+    ]
+    for linha in campos:
+        c.drawString(2*cm, y, linha); y -= 0.8*cm
+
+    if texto:
+        c.setFont("Helvetica-Bold", 12); c.drawString(2*cm, y, "Descrição/Notas de Evidência:"); y -= 0.7*cm
+        c.setFont("Helvetica", 11)
+        for para in texto.splitlines():
+            c.drawString(2.2*cm, y, para[:120]); y -= 0.6*cm
+
+    if link:
+        y -= 0.4*cm; c.setFont("Helvetica-Bold", 12); c.drawString(2*cm, y, "Link/E-mail de Evidência:"); y -= 0.7*cm
+        c.setFont("Helvetica", 11); c.drawString(2.2*cm, y, link); y -= 0.8*cm
+
+    if arquivos:
+        c.setFont("Helvetica-Bold", 12); c.drawString(2*cm, y, "Arquivos de Evidência:"); y -= 0.7*cm
+        c.setFont("Helvetica", 11)
+        for f in arquivos:
+            c.drawString(2.2*cm, y, os.path.basename(f)); y -= 0.6*cm
+
+    img_exts = {".png", ".jpg", ".jpeg"}
+    primeira_img = next((f for f in arquivos if os.path.splitext(f)[1].lower() in img_exts), None)
+    if primeira_img:
+        try:
+            y -= 0.3*cm; c.setFont("Helvetica-Bold", 12); c.drawString(2*cm, y, "Prévia da Imagem:"); y -= 0.8*cm
+            img = ImageReader(primeira_img); iw, ih = img.getSize(); max_w, max_h = w - 4*cm, 8*cm
+            esc = min(max_w/iw, max_h/ih); dw, dh = iw*esc, ih*esc
+            c.drawImage(img, 2*cm, max(y - dh, 2*cm), width=dw, height=dh, preserveAspectRatio=True)
+            y = max(y - dh - 0.8*cm, 2*cm)
+        except Exception as e:
+            c.setFont("Helvetica", 10); c.drawString(2*cm, y, f"Falha ao inserir prévia: {e}"); y -= 0.6*cm
+
+    c.showPage(); c.save(); return arquivo_pdf
+
+
+def concluir_tarefa(task_id: int, ev_files: Optional[List[str]] = None, ev_texto: str = "", ev_link: str = ""):
+    hoje = date.today(); conn = get_conn(); cur = conn.cursor()
+    cur.execute("UPDATE tasks SET status = ?, progress = ?, due_date = ? WHERE id = ?",
+                ("Concluída", 100, str(hoje), task_id))
+    conn.commit(); conn.close()
+
+    copiados = copiar_arquivos_evidencia(task_id, ev_files or [])
+    gerar_pdf_evidencia(task_id, copiados, ev_texto, ev_link)
+    notas = f"arquivos={len(copiados)}; texto={'sim' if ev_texto else 'nao'}; link={'sim' if ev_link else 'nao'}"
+    registrar_acao(task_id, "Concluída", notas)
+
+# -----------------------------
+# CRUD de tarefas (parsing robusto)
+# -----------------------------
+def inserir_tarefa(titulo: str, descricao: str, responsavel: str, prioridade: str, status: str,
+                   inicio: str, prazo: str, ppg: str, periodo: str, area: str, cc: str,
+                   total: float, quantidade: float, unitario: float, conclusao_inicial: int = 0) -> int:
+    conn = get_conn(); cur = conn.cursor()
+    cur.execute("""
+        INSERT INTO tasks (title, description, owner, priority, status, progress, start_date, due_date, tags,
+                           ppg_number, measurement_period, area, cc, total_value, quantity, unit_value)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    """,
+    (titulo, descricao, responsavel, prioridade, status, conclusao_inicial, inicio, prazo, None,
+     ppg, periodo, area, cc, total, quantidade, unitario))
+    conn.commit(); new_id = cur.lastrowid; conn.close(); return new_id
+
+
+def atualizar_tarefa(task_id: int, titulo: str, descricao: str, responsavel: str, prioridade: str,
+                      status: str, inicio: str, prazo: str, ppg: str, periodo: str, area: str, cc: str,
+                      total: float, quantidade: float, unitario: float, progresso: Optional[int] = None):
+    if progresso is None:
+        progresso = 100 if status == "Concluída" else None
+    conn = get_conn(); cur = conn.cursor()
+    if progresso is None:
+        cur.execute("""
+            UPDATE tasks SET title=?, description=?, owner=?, priority=?, status=?, start_date=?, due_date=?,
+                           ppg_number=?, measurement_period=?, area=?, cc=?, total_value=?, quantity=?, unit_value=?
+            WHERE id=?
+        """,
+        (titulo, descricao, responsavel, prioridade, status, inicio, prazo, ppg, periodo, area, cc, total, quantidade, unitario, task_id))
+    else:
+        cur.execute("""
+            UPDATE tasks SET title=?, description=?, owner=?, priority=?, status=?, progress=?, start_date=?, due_date=?,
+                           ppg_number=?, measurement_period=?, area=?, cc=?, total_value=?, quantity=?, unit_value=?
+            WHERE id=?
+        """,
+        (titulo, descricao, responsavel, prioridade, status, progresso, inicio, prazo, ppg, periodo, area, cc, total, quantidade, unitario, task_id))
+    conn.commit(); conn.close(); registrar_acao(task_id, "Editar", f"Status={status}; Prazo={prazo}; Qtde={quantidade}; Unit={unitario}; Total={total}")
+
+
+def alterar_status(task_id: int, novo_status: str):
+    if novo_status not in STATUSES:
+        raise ValueError("Status inválido")
+    progresso = 100 if novo_status == "Concluída" else 0
+    conn = get_conn(); cur = conn.cursor(); cur.execute("UPDATE tasks SET status=?, progress=? WHERE id=?", (novo_status, progresso, task_id))
+    conn.commit(); conn.close(); registrar_acao(task_id, "Alterar Status", f"{novo_status}")
+
+
+def excluir_tarefa(task_id: int):
+    conn = get_conn(); cur = conn.cursor(); cur.execute("DELETE FROM tasks WHERE id=?", (task_id,))
+    conn.commit(); conn.close(); registrar_acao(task_id, "Excluir", "Removida do banco")
+
+# -----------------------------
+# Exportação – PDF e Excel
+# -----------------------------
+def exportar_tarefas_para_pdf(destino: Optional[str] = None) -> str:
+    conn = get_conn(); cur = conn.cursor()
+    cur.execute("""
+        SELECT id,title,owner,status,due_date,quantity,unit_value,total_value,
+               ppg_number,measurement_period,area,cc
+        FROM tasks
+        ORDER BY owner, status, due_date
+    """)
+    rows = cur.fetchall(); conn.close()
+
+    if destino is None:
+        destino = f"export_tarefas_{datetime.now().strftime('%Y%m%d_%H%M%S')}.pdf"
+
+    c = canvas.Canvas(destino, pagesize=A4); w, h = A4
+    c.setFillColorRGB(0.24, 0.51, 0.79); c.rect(0, h - 2.5*cm, w, 2.5*cm, fill=1, stroke=0)
+    c.setFillColorRGB(1, 1, 1); c.setFont("Helvetica-Bold", 16)
+    c.drawString(2*cm, h - 1.2*cm, "Exportação de Tarefas")
+
+    c.setFillColorRGB(0, 0, 0); c.setFont("Helvetica", 10)
+    c.drawString(2*cm, h - 2.9*cm, f"Gerado em: {datetime.now().strftime('%d/%m/%Y %H:%M:%S')}")
+
+    y = h - 3.6*cm
+    c.setFont("Helvetica-Bold", 11); c.drawString(2*cm, y, "Resumo")
+
+    def _calc_total(r):
+        qt = float(r[5] or 0.0)
+        un = float(r[6] or 0.0)
+        tv = r[7]
+        return float(tv) if tv is not None else (qt * un)
+
+    y -= 0.6*cm; c.setFont("Helvetica", 10)
+    total_reg = len(rows); soma_total = sum(_calc_total(r) for r in rows)
+    c.drawString(2*cm, y, f"Total de atividades: {total_reg}")
+    c.drawString(9*cm, y, f"TOTAL: {fmt_brl(soma_total)}")
+    y -= 0.8*cm
+
+    col_names = ["ID","Título","Responsável","Status","Prazo","Qtde","Unitário","Total","PPG","Período","Área","CC"]
+    col_widths = [1.2*cm, 5.5*cm, 3.0*cm, 2.2*cm, 2.0*cm, 1.6*cm, 2.0*cm, 2.2*cm, 2.2*cm, 2.4*cm, 2.4*cm, 2.0*cm]
+    c.setFont("Helvetica-Bold", 9)
+    x = 1.2*cm; y_header = y
+    for name, wcol in zip(col_names, col_widths):
+        c.drawString(x, y_header, name); x += wcol
+    y = y_header - 0.4*cm; c.setFont("Helvetica", 9)
+
+    def flush_page_footer():
+        c.setFont("Helvetica", 9); c.drawRightString(w - 1*cm, 1*cm, f"Página {c.getPageNumber()}")
+
+    for r in rows:
+        calc_total = _calc_total(r)
+        data = [r[0], r[1], r[2] or '', r[3], r[4] or '', r[5] or 0, r[6] or 0.0, calc_total, r[8] or '', r[9] or '', r[10] or '', r[11] or '']
+        if y < 2.2*cm:
+            flush_page_footer(); c.showPage()
+            c.setFillColorRGB(0.24, 0.51, 0.79); c.rect(0, h - 2.5*cm, w, 2.5*cm, fill=1, stroke=0)
+            c.setFillColorRGB(1, 1, 1); c.setFont("Helvetica-Bold", 16); c.drawString(2*cm, h - 1.2*cm, "Exportação de Tarefas")
+            c.setFillColorRGB(0, 0, 0); c.setFont("Helvetica-Bold", 9)
+            y = h - 3.0*cm; x = 1.2*cm
+            for name, wcol in zip(col_names, col_widths):
+                c.drawString(x, y, name); x += wcol
+            y -= 0.4*cm; c.setFont("Helvetica", 9)
+        x = 1.2*cm
+        values_fmt = [str(data[0]), str(data[1])[:48], str(data[2])[:20], str(data[3])[:12], str(data[4])[:10],
+                      f"{float(data[5]):.2f}", fmt_brl(float(data[6])), fmt_brl(float(data[7])),
+                      str(data[8])[:12], str(data[9])[:10], str(data[10])[:12], str(data[11])[:10]]
+        for val, wcol in zip(values_fmt, col_widths):
+            c.drawString(x, y, val); x += wcol
+        y -= 0.36*cm
+
+    flush_page_footer(); c.showPage(); c.save(); return destino
+
+# -----------------------------
+# UI – Janela de Evidências
+# -----------------------------
+class JanelaEvidencias(tk.Toplevel):
+    def __init__(self, master, task_id: int):
+        super().__init__(master)
+        self.title("Evidências da Conclusão")
+        self.geometry("1000x700"); self.minsize(860, 560)
+        self.transient(master); self.grab_set(); self.task_id = task_id
+        self.files: List[str] = []; self.link_var = tk.StringVar()
+
+        tk.Label(self, text=f"Tarefa ID: {task_id}", font=("Segoe UI", 12, "bold")).pack(anchor="w", padx=12, pady=(10,4))
+        tk.Label(self, text="Descrição/Notas de Evidência:").pack(anchor="w", padx=12)
+        self.txt = tk.Text(self, height=8, wrap=tk.WORD); self.txt.pack(fill=tk.X, padx=12, pady=(0,10))
+        tk.Label(self, text="Link ou E-mail:").pack(anchor="w", padx=12)
+        tk.Entry(self, textvariable=self.link_var).pack(fill=tk.X, padx=12, pady=(0,10))
+
+        fr = tk.Frame(self); fr.pack(fill=tk.BOTH, expand=True, padx=12, pady=10)
+        tk.Label(fr, text="Arquivos de Evidência:").pack(anchor="w")
+        self.listbox = tk.Listbox(fr, height=12); self.listbox.pack(fill=tk.BOTH, expand=True, pady=6)
+        bfr = tk.Frame(fr); bfr.pack(fill=tk.X)
+        ttk.Button(bfr, text="Adicionar Arquivo(s)", command=self.add_files).pack(side=tk.LEFT)
+        ttk.Button(bfr, text="Remover Selecionado(s)", command=self.remove_selected).pack(side=tk.LEFT, padx=6)
+
+        act = tk.Frame(self); act.pack(fill=tk.X, padx=12, pady=10)
+        ttk.Button(act, text="Confirmar", command=self.confirm).pack(side=tk.RIGHT, padx=6)
+        ttk.Button(act, text="Cancelar", command=self.cancel).pack(side=tk.RIGHT)
+        self.result = None
+
+    def add_files(self):
+        paths = filedialog.askopenfilenames(title="Selecione evidências",
+            filetypes=[("Todos", "*.*"), ("Imagens", "*.png;*.jpg;*.jpeg"), ("PDF", "*.pdf"), ("Documentos", "*.doc;*.docx;*.xlsx;*.pptx")])
+        for p in paths:
+            if p:
+                self.files.append(p); self.listbox.insert(tk.END, p)
+
+    def remove_selected(self):
+        sel = list(self.listbox.curselection()); sel.reverse()
+        for i in sel:
+            self.listbox.delete(i)
+            try:
+                del self.files[i]
+            except Exception:
+                pass
+
+    def confirm(self):
+        self.result = {'files': self.files.copy(), 'text': self.txt.get("1.0", tk.END).strip(), 'link': self.link_var.get().strip()}
+        self.destroy()
+
+    def cancel(self):
+        self.result = None; self.destroy()
+# -----------------------------
+# UI – Abas KPIs, Responsáveis, Nova Atividade
+# -----------------------------
+class AbaKPIs(tk.Frame):
+    def __init__(self, master_notebook: ttk.Notebook):
+        super().__init__(master_notebook); self._build()
+
+    def _build(self):
+        header = tk.Frame(self); header.pack(fill=tk.X)
+        tk.Label(header, text="KPIs (Números)", font=("Segoe UI", 16, "bold")).pack(side=tk.LEFT, padx=12, pady=8)
+        ttk.Button(header, text="Atualizar KPIs", command=self._render_kpis).pack(side=tk.RIGHT, padx=12)
+        self.cards = tk.Frame(self); self.cards.pack(fill=tk.X, padx=12)
+
+        tables = tk.Frame(self); tables.pack(fill=tk.BOTH, expand=True, padx=12, pady=8)
+        tk.Label(tables, text="KPIs por Status", font=("Segoe UI", 12, "bold")).pack(anchor='w')
+        cols_st = ("Status", "Qtde", "TOTAL R$")
+        self.tv_st = ttk.Treeview(tables, columns=cols_st, show='headings', height=6)
+        for c in cols_st:
+            self.tv_st.heading(c, text=c); self.tv_st.column(c, width=160 if c != "Status" else 200)
+        self.tv_st.pack(fill=tk.X, pady=6)
+
+        tk.Label(tables, text="KPIs por Responsável", font=("Segoe UI", 12, "bold")).pack(anchor='w', pady=(10,0))
+        cols_own = ("Responsável", "Qtde", "TOTAL R$")
+        self.tv_own = ttk.Treeview(tables, columns=cols_own, show='headings', height=10)
+        for c in cols_own:
+            self.tv_own.heading(c, text=c); self.tv_own.column(c, width=180 if c != "Responsável" else 220)
+        self.tv_own.pack(fill=tk.BOTH, expand=True, pady=6)
+
+        self._render_kpis()
+
+    def _render_kpis(self):
+        for w in self.cards.winfo_children():
+            w.destroy()
+        k = kpis_gerais()
+
+        def card(parent, title, value):
+            f = tk.Frame(parent, bg="#ffffff", bd=1, relief=tk.SOLID); f.pack(side=tk.LEFT, padx=6, pady=6)
+            tk.Label(f, text=title, bg="#ffffff", font=("Segoe UI", 10, "bold")).pack(padx=12, pady=(8,2))
+            tk.Label(f, text=value, bg="#ffffff", font=("Segoe UI", 14)).pack(padx=12, pady=(0,8))
+
+        # Cards principais
+        card(self.cards, "Atividades (Total)", f"{k['count_total']}")
+        card(self.cards, "TOTAL (Geral)", fmt_brl(k['sum_total']))
+        card(self.cards, "% Conclusão (média)", f"{k['avg_progress']:,.1f}%")
+
+        # NOVO CARD: Colaborador com mais atrasos
+        atraso_owner = k.get('late_top_owner') or "(sem dados)"
+        atraso_qtd = k.get('late_top_count', 0)
+        card(self.cards, "Mais atrasos", f"{atraso_owner} ({atraso_qtd})")
+
+        # Preencher tabelas
+        for tv in (self.tv_st, self.tv_own):
+            for i in tv.get_children():
+                tv.delete(i)
+
+        for st in STATUSES:
+            self.tv_st.insert('', tk.END, values=(st, k[f"count_{st}"], fmt_brl(k[f'sum_{st}'])))
+
+        for owner, qtde, soma in k["por_owner"]:
+            self.tv_own.insert('', tk.END, values=(owner, qtde, fmt_brl(soma)))
+
+class AbaResponsaveis(tk.Frame):
+    def __init__(self, master_notebook: ttk.Notebook, on_change_callback=None):
+        super().__init__(master_notebook)
+        self.on_change = on_change_callback
+        self._build()
+
+    def _build(self):
+        tk.Label(self, text="Cadastro de Responsáveis", font=("Segoe UI", 16, "bold")).pack(anchor='w', padx=12, pady=8)
+        form = tk.Frame(self);
+        form.pack(fill=tk.X, padx=12)
+        tk.Label(form, text="Nome*").grid(row=0, column=0, sticky='w', padx=4, pady=4)
+        self.nome_var = tk.StringVar();
+        ttk.Entry(form, textvariable=self.nome_var, width=40).grid(row=0, column=1, sticky='w', padx=4, pady=4)
+        tk.Label(form, text="Chave da pessoa*").grid(row=1, column=0, sticky='w', padx=4, pady=4)
+        self.chave_var = tk.StringVar();
+        ttk.Entry(form, textvariable=self.chave_var, width=40).grid(row=1, column=1, sticky='w', padx=4, pady=4)
+        btns = tk.Frame(form);
+        btns.grid(row=2, column=0, columnspan=2, sticky='e')
+        ttk.Button(btns, text="Adicionar", command=self._add).pack(side=tk.RIGHT, padx=6)
+        ttk.Button(btns, text="Remover Selecionado", command=self._del).pack(side=tk.RIGHT)
+        ttk.Button(btns, text="Exportar para Excel", command=self._export_excel).pack(side=tk.RIGHT, padx=6)
+        self.tv = ttk.Treeview(self, columns=("Nome", "Chave"), show='headings', height=10)
+        self.tv.heading("Nome", text="Nome");
+        self.tv.heading("Chave", text="Chave")
+        self.tv.column("Nome", width=240);
+        self.tv.column("Chave", width=200)
+        self.tv.pack(fill=tk.BOTH, expand=True, padx=12, pady=8)
+        self._refresh()
+
+    def _refresh(self):
+        for i in self.tv.get_children(): self.tv.delete(i)
+        for n, k in get_owners_with_keys(): self.tv.insert('', tk.END, values=(n, k))
+        if callable(self.on_change): self.on_change()
+
+    def _add(self):
+        try:
+            add_owner(self.nome_var.get().strip(), self.chave_var.get().strip())
+            self.nome_var.set("");
+            self.chave_var.set("")
+            self._refresh();
+            messagebox.showinfo("Responsáveis", "Responsável adicionado com sucesso.")
+        except Exception as e:
+            messagebox.showerror("Erro", str(e))
+
+    def _del(self):
+        sel = self.tv.focus()
+        if not sel:
+            messagebox.showwarning("Aviso", "Selecione um responsável.");
+            return
+        nome = self.tv.item(sel)['values'][0]
+        if not messagebox.askyesno("Remover", f"Remover {nome}?"): return
+        delete_owner(nome);
+        self._refresh()
+
+    def _export_excel(self):
+        try:
+            owners = get_owners_with_keys()
+            df = pd.DataFrame(owners, columns=['Nome', 'Chave'])
+            fname = f"responsaveis_{datetime.now().strftime('%Y%m%d_%H%M%S')}.xlsx"
+            with pd.ExcelWriter(fname, engine='openpyxl') as writer:
+                df.to_excel(writer, index=False, sheet_name='responsaveis')
+            messagebox.showinfo("Exportação", f"Arquivo gerado:\n{fname}")
+        except Exception as e:
+            messagebox.showerror("Erro", f"Falha ao exportar: {e}")
+
+class AbaNovaAtividade(tk.Frame):
+    def __init__(self, master_notebook: ttk.Notebook, on_saved_callback, owners_provider):
+        super().__init__(master_notebook)
+        self.nb = master_notebook; self.on_saved = on_saved_callback; self.owners_provider = owners_provider
+        self.df_servicos = None; self.servico_to_valor = {}
+        self._build_form()
+
+    def _build_form(self):
+        pad = {'padx': 10, 'pady': 6}
+        tk.Label(self, text="Nova Atividade", font=("Segoe UI", 16, "bold")).grid(row=0, column=0, sticky='w', **pad)
+        ttk.Button(self, text="Carregar Planilha de Serviços (.xlsx)", command=self._load_planilha).grid(row=0, column=1, sticky='e', **pad)
+
+        tk.Label(self, text="Serviço (Coluna 3)").grid(row=1, column=0, sticky='w', **pad)
+        self.servico_var = tk.StringVar(); self.servico_cb = ttk.Combobox(self, textvariable=self.servico_var, width=60)
+        self.servico_cb.grid(row=1, column=1, sticky='w', **pad); self.servico_cb.bind('<<ComboboxSelected>>', lambda e: self._on_servico_selected())
+
+        tk.Label(self, text="Título*").grid(row=2, column=0, sticky='w', **pad)
+        self.titulo_var = tk.StringVar(); ttk.Entry(self, textvariable=self.titulo_var, width=60).grid(row=2, column=1, sticky='w', **pad)
+
+        tk.Label(self, text="Descrição").grid(row=3, column=0, sticky='w', **pad)
+        self.desc = tk.Text(self, height=4, width=60, wrap=tk.WORD); self.desc.grid(row=3, column=1, sticky='w', **pad)
+
+        tk.Label(self, text="Responsável*").grid(row=4, column=0, sticky='w', **pad)
+        self.resp_var = tk.StringVar(); self.resp_cb = ttk.Combobox(self, textvariable=self.resp_var, width=40)
+        self.resp_cb['values'] = self.owners_provider(); self.resp_cb.grid(row=4, column=1, sticky='w', **pad)
+
+        tk.Label(self, text="Prioridade").grid(row=5, column=0, sticky='w', **pad)
+        self.prio_var = tk.StringVar(value=PRIORIDADES[1]); self.prio_cb = ttk.Combobox(self, textvariable=self.prio_var, values=PRIORIDADES, width=20)
+        self.prio_cb.grid(row=5, column=1, sticky='w', **pad)
+
+        tk.Label(self, text="Status*").grid(row=6, column=0, sticky='w', **pad)
+        self.status_var = tk.StringVar(value=STATUSES[0]); self.status_cb = ttk.Combobox(self, textvariable=self.status_var, values=STATUSES, width=20)
+        self.status_cb.grid(row=6, column=1, sticky='w', **pad)
+
+        tk.Label(self, text="Início (YYYY-MM-DD)").grid(row=7, column=0, sticky='w', **pad)
+        self.inicio_var = tk.StringVar(value=str(date.today())); ttk.Entry(self, textvariable=self.inicio_var, width=20).grid(row=7, column=1, sticky='w', **pad)
+
+        tk.Label(self, text="Prazo (YYYY-MM-DD)*").grid(row=8, column=0, sticky='w', **pad)
+        self.prazo_var = tk.StringVar(value=str(date.today()+timedelta(days=7))); ttk.Entry(self, textvariable=self.prazo_var, width=20).grid(row=8, column=1, sticky='w', **pad)
+
+        tk.Label(self, text="N° PPG").grid(row=9, column=0, sticky='w', **pad)
+        self.ppg_var = tk.StringVar(); ttk.Entry(self, textvariable=self.ppg_var, width=20).grid(row=9, column=1, sticky='w', **pad)
+
+        tk.Label(self, text="Período de Medição").grid(row=10, column=0, sticky='w', **pad)
+        self.periodo_var = tk.StringVar(value=datetime.now().strftime('%Y-%m')); ttk.Entry(self, textvariable=self.periodo_var, width=20).grid(row=10, column=1, sticky='w', **pad)
+
+        tk.Label(self, text="Área").grid(row=11, column=0, sticky='w', **pad)
+        self.area_var = tk.StringVar(); ttk.Entry(self, textvariable=self.area_var, width=20).grid(row=11, column=1, sticky='w', **pad)
+
+        tk.Label(self, text="CC").grid(row=12, column=0, sticky='w', **pad)
+        self.cc_var = tk.StringVar(); ttk.Entry(self, textvariable=self.cc_var, width=20).grid(row=12, column=1, sticky='w', **pad)
+
+        tk.Label(self, text="Quantidade*").grid(row=13, column=0, sticky='w', **pad)
+        self.qtde_var = tk.StringVar(value='1'); qtde_entry = ttk.Entry(self, textvariable=self.qtde_var, width=12)
+        qtde_entry.grid(row=13, column=1, sticky='w', **pad); qtde_entry.bind('<KeyRelease>', lambda e: self._recalc_total())
+
+        tk.Label(self, text="Valor Unitário (coluna 6)").grid(row=14, column=0, sticky='w', **pad)
+        self.unit_var = tk.StringVar(value='0,00'); self.unit_entry = ttk.Entry(self, textvariable=self.unit_var, width=20)
+        self.unit_entry.grid(row=14, column=1, sticky='w', **pad); self.unit_entry.bind('<KeyRelease>', lambda e: self._recalc_total())
+
+        tk.Label(self, text="TOTAL*").grid(row=15, column=0, sticky='w', **pad)
+        self.total_var = tk.StringVar(value='0,00'); self.total_entry = ttk.Entry(self, textvariable=self.total_var, width=20)
+        self.total_entry.grid(row=15, column=1, sticky='w', **pad)
+
+        btns = tk.Frame(self); btns.grid(row=16, column=0, columnspan=2, sticky='e', **pad)
+        ttk.Button(btns, text="Salvar", command=self._salvar).pack(side=tk.RIGHT, padx=6)
+        ttk.Button(btns, text="Cancelar", command=self._fechar).pack(side=tk.RIGHT)
+
+    def _load_planilha(self):
+        path = filedialog.askopenfilename(title="Selecione a Planilha de Serviços (.xlsx)", filetypes=[("Excel", ".xlsx")])
+        if not path:
+            return
+        safe_path = os.path.normpath(path.replace("'", "").replace(",", ""))
+        if not os.path.exists(safe_path):
+            messagebox.showwarning("Planilha", f"Caminho inválido:\n{safe_path}"); return
+        try:
+            import tempfile
+            tmp_dir = tempfile.mkdtemp(prefix="kbn_")
+            tmp_path = os.path.join(tmp_dir, os.path.basename(safe_path))
+            shutil.copy2(safe_path, tmp_path)
+            df = pd.read_excel(tmp_path, header=None, engine='openpyxl')
+            if df.shape[1] < 6:
+                messagebox.showwarning("Planilha", "A planilha precisa ter pelo menos 6 colunas."); return
+            servicos = df.iloc[:, 2].astype(str).str.strip().tolist()  # col 3
+            valores = df.iloc[:, 5]  # col 6
+            mapping = {}
+            for s, v in zip(servicos, valores):
+                try:
+                    mapping[s] = float(str(v).replace(',', '.'))
+                except Exception:
+                    mapping[s] = 0.0
+            self.df_servicos = df; self.servico_to_valor = mapping
+            self.servico_cb['values'] = servicos
+            messagebox.showinfo("Planilha", f"Serviços carregados: {len(servicos)} itens.")
+        except Exception as e:
+            messagebox.showerror("Planilha", f"Falha ao ler planilha: {e}")
+
+    def _on_servico_selected(self):
+        s = self.servico_var.get().strip()
+        if s:
+            self.titulo_var.set(s)
+            unit = self.servico_to_valor.get(s, 0.0)
+            self.unit_var.set(fmt_num_brl(unit))
+            self._recalc_total()
+
+    def _recalc_total(self):
+        try:
+            unit = parse_money(self.unit_var.get())
+        except Exception:
+            unit = 0.0
+        try:
+            qtde = float(str(self.qtde_var.get()).replace(',', '.') or 0)
+        except Exception:
+            qtde = 0.0
+        total = unit * qtde
+        self.total_var.set(fmt_num_brl(total))
+
+    def _salvar(self):
+        titulo = self.titulo_var.get().strip(); resp = self.resp_var.get().strip(); status = self.status_var.get().strip(); prazo = self.prazo_var.get().strip()
+        if not (titulo and resp and status and prazo):
+            messagebox.showwarning("Validação", "Preencha Título, Responsável, Status e Prazo."); return
+        try:
+            quantidade = float(str(self.qtde_var.get()).replace(',', '.') or 0)
+            unitario = parse_money(self.unit_var.get())
+            total = parse_money(self.total_var.get())
+        except Exception:
+            messagebox.showwarning("Validação", "Informe Quantidade/Unitário/Total válidos."); return
+        try:
+            new_id = inserir_tarefa(
+                titulo=titulo,
+                descricao=self.desc.get("1.0", tk.END).strip(),
+                responsavel=resp,
+                prioridade=self.prio_var.get().strip() or PRIORIDADES[1],
+                status=status,
+                inicio=self.inicio_var.get().strip() or str(date.today()),
+                prazo=prazo,
+                ppg=self.ppg_var.get().strip(),
+                periodo=self.periodo_var.get().strip(),
+                area=self.area_var.get().strip(),
+                cc=self.cc_var.get().strip(),
+                total=total,
+                quantidade=quantidade,
+                unitario=unitario,
+                conclusao_inicial=0 if status != "Concluída" else 100
+            )
+            registrar_acao(new_id, "Cadastro", f"Nova Atividade; Unit={unitario}; Qtde={quantidade}; Total={total}")
+            messagebox.showinfo("Sucesso", f"Atividade criada (ID {new_id}).")
+            self.resp_cb['values'] = self.owners_provider()
+            if callable(self.on_saved):
+                self.on_saved()
+            self._fechar()
+        except Exception as e:
+            messagebox.showerror("Erro", f"Falha ao salvar: {e}")
+
+    def _fechar(self):
+        idx = self.nb.index(self); self.nb.forget(idx)
+
+# -----------------------------
+# Aplicação principal
+# -----------------------------
+class KanbanApp(tk.Tk):
+    def __init__(self):
+        super().__init__()
+        self.title("Sistema de Gestão de Atividades – v1.4.12 (PT-BR)")
+        self.geometry("1200x820"); self.minsize(1020, 700)
+        self.configure(bg="#f8f9fa")
+        self.nb = ttk.Notebook(self); self.nb.pack(fill=tk.BOTH, expand=True)
+
+        # Board
+        self.tab_board = tk.Frame(self.nb, bg="#f8f9fa"); self.nb.add(self.tab_board, text="Board por Colaborador")
+        self._build_board_tab(); self.refresh_board()
+
+        # KPIs
+        self.tab_kpis = AbaKPIs(self.nb); self.nb.add(self.tab_kpis, text="KPIs")
+
+        # Responsáveis
+        self.tab_resp = AbaResponsaveis(self.nb, on_change_callback=self._owners_updated); self.nb.add(self.tab_resp, text="Responsáveis")
+
+        # Nova Atividade
+        self.tab_new = None
+
+        # Exportação
+        self.tab_exp = AbaExportacao(self.nb); self.nb.add(self.tab_exp, text="Exportação")
+
+    def _build_board_tab(self):
+        header = tk.Frame(self.tab_board, bg="#ffffff", height=60); header.pack(fill=tk.X, side=tk.TOP)
+        tk.Label(header, text="Board de Atividades", font=("Segoe UI", 16, "bold"), bg="#ffffff").pack(side=tk.LEFT, padx=20)
+        self.search_var = tk.StringVar(); ttk.Entry(header, textvariable=self.search_var, width=40).pack(side=tk.LEFT, padx=10)
+        ttk.Button(header, text="Buscar", command=self.search_and_focus).pack(side=tk.LEFT)
+        ttk.Button(header, text="Nova Atividade", command=self.open_new_task_tab).pack(side=tk.LEFT, padx=10)
+        ttk.Button(header, text="Atualizar", command=self.refresh_board).pack(side=tk.RIGHT, padx=20)
+
+        body = tk.Frame(self.tab_board, bg="#f8f9fa"); body.pack(fill=tk.BOTH, expand=True)
+        self.canvas = tk.Canvas(body, bg="#f0f0f0", highlightthickness=0)
+        self.canvas.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        scrollbar = ttk.Scrollbar(body, orient=tk.VERTICAL, command=self.canvas.yview)
+        scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
+        self.canvas.configure(yscrollcommand=scrollbar.set)
+        self.cards_container = tk.Frame(self.canvas, bg="#f0f0f0")
+        self.canvas.create_window((0, 0), window=self.cards_container, anchor="nw")
+        self.cards_container.bind("<Configure>", lambda e: self.canvas.configure(scrollregion=self.canvas.bbox("all")))
+
+    def open_new_task_tab(self):
+        form_tab = AbaNovaAtividade(self.nb, on_saved_callback=self._on_new_saved, owners_provider=obter_colaboradores)
+        self.nb.add(form_tab, text="Nova Atividade"); self.nb.select(form_tab); self.tab_new = form_tab
+
+    def _on_new_saved(self):
+        self.refresh_board(); self.tab_kpis._render_kpis()
+
+    def _owners_updated(self):
+        tab_new = getattr(self, 'tab_new', None)
+        if tab_new is not None:
+            try:
+                self.tab_new.resp_cb['values'] = obter_colaboradores()
+            except Exception:
+                pass
+
+    def clear_cards(self):
+        for w in self.cards_container.winfo_children():
+            w.destroy()
+
+    def refresh_board(self):
+        self.clear_cards(); owners = obter_colaboradores(); cols = 3; r = c = 0
+        for owner in owners:
+            card = self._make_owner_card(self.cards_container, owner)
+            card.grid(row=r, column=c, padx=12, pady=12, sticky='nsew'); c += 1
+            if c >= cols:
+                c = 0; r += 1
+        for i in range(cols):
+            self.cards_container.grid_columnconfigure(i, weight=1)
+
+    def _make_owner_card(self, parent, owner: str) -> tk.Frame:
+        conn = get_conn(); cur = conn.cursor(); cur.execute("SELECT status, COUNT(*) FROM tasks WHERE owner = ? GROUP BY status", (owner,))
+        rows = cur.fetchall(); conn.close(); counts = {s: 0 for s in STATUSES}
+        for s, n in rows:
+            counts[s] = n
+        card = tk.Frame(parent, bg="#ffffff", bd=2, relief=tk.GROOVE)
+        hdr = tk.Frame(card, bg="#e9ecef"); hdr.pack(fill=tk.X)
+        tk.Label(hdr, text=owner or "(sem responsável)", font=("Segoe UI", 13, "bold"), bg="#e9ecef").pack(side=tk.LEFT, padx=10, pady=8)
+        ttk.Button(hdr, text="Abrir", command=lambda o=owner: self.open_owner_modal(o)).pack(side=tk.RIGHT, padx=8, pady=6)
+
+        body = tk.Frame(card, bg="#ffffff"); body.pack(fill=tk.BOTH, expand=True, padx=10, pady=8)
+        for st in STATUSES:
+            row = tk.Frame(body, bg="#ffffff"); row.pack(fill=tk.X)
+            dot = tk.Canvas(row, width=14, height=14, bg="#ffffff", highlightthickness=0)
+            dot.create_oval(2,2,12,12, fill=STATUS_COLORS[st], outline=""); dot.pack(side=tk.LEFT)
+            tk.Label(row, text=f"{st}: {counts.get(st,0)}", bg="#ffffff", font=("Segoe UI", 11)).pack(side=tk.LEFT, padx=6)
+        return card
+
+    def search_and_focus(self):
+        q = self.search_var.get().strip().lower();
+        if not q:
+            return
+        for w in self.cards_container.winfo_children():
+            hdr = w.winfo_children()[0]; lbls = [c for c in hdr.winfo_children() if isinstance(c, tk.Label)]
+            text = " ".join([l.cget("text").lower() for l in lbls])
+            if q in text:
+                w.configure(bg="#e8f5ff")
+        messagebox.showinfo("Busca", "Colaboradores relacionados foram destacados.")
+
+    # Modal com scroll + edição com recálculo de total (BRL)
+    def open_owner_modal(self, owner: str):
+        m = tk.Toplevel(self); m.title(f"Atividades de {owner}")
+        sw, sh = m.winfo_screenwidth(), m.winfo_screenheight()
+        proporcao = 0.9; min_w, min_h = 1000, 700
+        w, h = max(int(sw*proporcao), min_w), max(int(sh*proporcao), min_h)
+        x, y = max(int((sw - w)//2), 0), max(int((sh - h)//2), 0)
+        m.geometry(f"{w}x{h}+{x}+{y}"); m.minsize(min_w, min_h)
+        m.transient(self); m.grab_set()
+
+        modal_canvas = tk.Canvas(m, highlightthickness=0)
+        vscroll = ttk.Scrollbar(m, orient=tk.VERTICAL, command=modal_canvas.yview)
+        modal_canvas.configure(yscrollcommand=vscroll.set)
+        modal_canvas.pack(side=tk.LEFT, fill=tk.BOTH, expand=True); vscroll.pack(side=tk.RIGHT, fill=tk.Y)
+        root = tk.Frame(modal_canvas); modal_canvas.create_window((0,0), window=root, anchor='nw')
+        root.bind('<Configure>', lambda e: modal_canvas.configure(scrollregion=modal_canvas.bbox('all')))
+
+        window_bar = tk.Frame(root); window_bar.pack(fill=tk.X)
+        def maximize():
+            try:
+                m.wm_state('zoomed')
+            except Exception:
+                m.geometry(f"{sw}x{sh}+0+0")
+        ttk.Button(window_bar, text="Maximizar", command=maximize).pack(side=tk.LEFT, padx=4, pady=4)
+        ttk.Button(window_bar, text="Fechar", command=m.destroy).pack(side=tk.RIGHT, padx=4, pady=4)
+
+        header = tk.Frame(root); header.pack(fill=tk.X)
+        tk.Label(header, text=f"Responsável: {owner}", font=("Segoe UI", 16, "bold")).pack(side=tk.LEFT, padx=12, pady=8)
+        tk.Label(header, text="Status:").pack(side=tk.LEFT)
+        status_var = tk.StringVar(value="(Todos)")
+        status_cb = ttk.Combobox(header, textvariable=status_var, values=["(Todos)"]+STATUSES, width=18); status_cb.pack(side=tk.LEFT, padx=6)
+        tk.Label(header, text="Buscar Título:").pack(side=tk.LEFT, padx=(20,0))
+        termo_var = tk.StringVar(); ttk.Entry(header, textvariable=termo_var, width=32).pack(side=tk.LEFT)
+        ttk.Button(header, text="Filtrar", command=lambda: load_list()).pack(side=tk.LEFT, padx=8)
+
+        container = tk.PanedWindow(root, orient=tk.HORIZONTAL); container.pack(fill=tk.BOTH, expand=True, padx=10, pady=10)
+        left_frame = tk.Frame(container)
+        left_canvas = tk.Canvas(left_frame, highlightthickness=0)
+        left_scroll = ttk.Scrollbar(left_frame, orient=tk.VERTICAL, command=left_canvas.yview)
+        left_canvas.configure(yscrollcommand=left_scroll.set)
+        left_inner = tk.Frame(left_canvas)
+        left_canvas.create_window((0,0), window=left_inner, anchor='nw')
+        left_inner.bind('<Configure>', lambda e: left_canvas.configure(scrollregion=left_canvas.bbox('all')))
+        left_canvas.pack(side=tk.LEFT, fill=tk.BOTH, expand=True); left_scroll.pack(side=tk.RIGHT, fill=tk.Y)
+
+        cols = ("ID", "Título", "Status", "Prazo", "%", "TOTAL", "Qtde", "Unit.")
+        tree = ttk.Treeview(left_inner, columns=cols, show="headings")
+        for c in cols:
+            tree.heading(c, text=c)
+            tree.column(c, width=140 if c not in ("Título","TOTAL","Unit.") else (420 if c=="Título" else 160))
+        tree.pack(fill=tk.BOTH, expand=True)
+
+        right_frame = tk.Frame(container); right_frame.grid_columnconfigure(0, weight=1)
+        right_frame.grid_rowconfigure(0, weight=0); right_frame.grid_rowconfigure(1, weight=1); right_frame.grid_rowconfigure(2, weight=0)
+        top_right = tk.Frame(right_frame); top_right.grid(row=0, column=0, sticky='ew')
+        detalhes = tk.Text(top_right, wrap=tk.WORD, height=12); detalhes.pack(fill=tk.X, expand=False, padx=4, pady=4)
+
+        edit = tk.LabelFrame(right_frame, text="Editar Atividade"); edit.grid(row=1, column=0, sticky='ew', padx=4, pady=6)
+        pad = {'padx': 6, 'pady': 4}
+        titulo_var = tk.StringVar(); ttk.Entry(edit, textvariable=titulo_var, width=64).grid(row=0, column=1, sticky='w', **pad)
+        tk.Label(edit, text="Título").grid(row=0, column=0, sticky='w', **pad)
+        desc_txt = tk.Text(edit, height=6, width=64, wrap=tk.WORD); desc_txt.grid(row=1, column=1, sticky='w', **pad)
+        tk.Label(edit, text="Descrição").grid(row=1, column=0, sticky='w', **pad)
+        resp_var = tk.StringVar(); resp_cb = ttk.Combobox(edit, textvariable=resp_var, values=obter_colaboradores(), width=30); resp_cb.grid(row=2, column=1, sticky='w', **pad)
+        tk.Label(edit, text="Responsável").grid(row=2, column=0, sticky='w', **pad)
+        prio_var = tk.StringVar(value=PRIORIDADES[1]); prio_cb = ttk.Combobox(edit, textvariable=prio_var, values=PRIORIDADES, width=20); prio_cb.grid(row=3, column=1, sticky='w', **pad)
+        tk.Label(edit, text="Prioridade").grid(row=3, column=0, sticky='w', **pad)
+        status_edit_var = tk.StringVar(); status_edit_cb = ttk.Combobox(edit, textvariable=status_edit_var, values=STATUSES, width=20); status_edit_cb.grid(row=4, column=1, sticky='w', **pad)
+        tk.Label(edit, text="Status").grid(row=4, column=0, sticky='w', **pad)
+        inicio_var = tk.StringVar(); ttk.Entry(edit, textvariable=inicio_var, width=20).grid(row=5, column=1, sticky='w', **pad)
+        tk.Label(edit, text="Início (YYYY-MM-DD)").grid(row=5, column=0, sticky='w', **pad)
+        prazo_var = tk.StringVar(); ttk.Entry(edit, textvariable=prazo_var, width=20).grid(row=6, column=1, sticky='w', **pad)
+        tk.Label(edit, text="Prazo (YYYY-MM-DD)").grid(row=6, column=0, sticky='w', **pad)
+        ppg_var = tk.StringVar(); ttk.Entry(edit, textvariable=ppg_var, width=20).grid(row=7, column=1, sticky='w', **pad)
+        tk.Label(edit, text="N° PPG").grid(row=7, column=0, sticky='w', **pad)
+        periodo_var = tk.StringVar(); ttk.Entry(edit, textvariable=periodo_var, width=20).grid(row=8, column=1, sticky='w', **pad)
+        tk.Label(edit, text="Período").grid(row=8, column=0, sticky='w', **pad)
+        area_var = tk.StringVar(); ttk.Entry(edit, textvariable=area_var, width=20).grid(row=9, column=1, sticky='w', **pad)
+        tk.Label(edit, text="Área").grid(row=9, column=0, sticky='w', **pad)
+        cc_var = tk.StringVar(); ttk.Entry(edit, textvariable=cc_var, width=20).grid(row=10, column=1, sticky='w', **pad)
+        tk.Label(edit, text="CC").grid(row=10, column=0, sticky='w', **pad)
+        total_var = tk.StringVar(); total_entry = ttk.Entry(edit, textvariable=total_var, width=20); total_entry.grid(row=11, column=1, sticky='w', **pad)
+        tk.Label(edit, text="TOTAL").grid(row=11, column=0, sticky='w', **pad)
+        qtde_var = tk.StringVar(); qtde_entry = ttk.Entry(edit, textvariable=qtde_var, width=12); qtde_entry.grid(row=12, column=1, sticky='w', **pad)
+        tk.Label(edit, text="Qtde").grid(row=12, column=0, sticky='w', **pad)
+        unit_var = tk.StringVar(); unit_entry = ttk.Entry(edit, textvariable=unit_var, width=20); unit_entry.grid(row=13, column=1, sticky='w', **pad)
+        tk.Label(edit, text="Unitário").grid(row=13, column=0, sticky='w', **pad)
+
+        # Recalcular total quando Qtde/Unitário mudarem (exibe BRL)
+        def recalc_from_fields():
+            try:
+                unit = parse_money(unit_var.get())
+            except Exception:
+                unit = 0.0
+            try:
+                qt = float(str(qtde_var.get()).replace(',', '.') or 0)
+            except Exception:
+                qt = 0.0
+            total_var.set(fmt_num_brl(unit*qt))
+        qtde_entry.bind('<KeyRelease>', lambda e: recalc_from_fields())
+        unit_entry.bind('<KeyRelease>', lambda e: recalc_from_fields())
+
+        act = tk.Frame(right_frame); act.grid(row=2, column=0, sticky='ew', padx=4, pady=8)
+        status_quick_var = tk.StringVar(value=STATUSES[0])
+        ttk.Label(act, text="Alterar Status:").pack(side=tk.LEFT)
+        ttk.Combobox(act, textvariable=status_quick_var, values=STATUSES, width=20).pack(side=tk.LEFT, padx=6)
+        ttk.Button(act, text="Salvar Alteração de Status", command=lambda: do_quick_status()).pack(side=tk.LEFT, padx=4)
+        ttk.Button(act, text="Salvar Alterações", command=lambda: do_save()).pack(side=tk.RIGHT, padx=4)
+        ttk.Button(act, text="Excluir", command=lambda: do_delete()).pack(side=tk.RIGHT, padx=4)
+        ttk.Button(act, text="Postergar", command=lambda: do_postponer()).pack(side=tk.RIGHT, padx=4)
+        ttk.Button(act, text="Concluir (Solicitar Evidências)", command=lambda: do_conclude()).pack(side=tk.RIGHT, padx=4)
+
+        container.add(left_frame, minsize=450); container.add(right_frame)
+        container.paneconfigure(left_frame, stretch='always'); container.paneconfigure(right_frame, stretch='always')
+
+        def apply_layout():
+            root.update_idletasks(); container.update_idletasks(); modal_canvas.update_idletasks()
+            total_w = container.winfo_width();
+            if total_w <= 0:
+                return
+            left_target = max(int(total_w * 0.40), 420)
+            try:
+                container.sashplace(0, left_target, 0)
+            except Exception:
+                pass
+            visible_w = max(left_target - 40, 320)
+            tree.column("Título", width=max(int(visible_w * 0.60), 300))
+            for c in ("ID","Status","Prazo","%","TOTAL","Qtde","Unit."):
+                tree.column(c, width=max(int(visible_w * 0.10), 100))
+        m.bind('<Configure>', lambda e: apply_layout())
+
+        def load_list():
+            for i in tree.get_children():
+                tree.delete(i)
+            st = status_var.get(); termo = termo_var.get(); st_filter = None if st == "(Todos)" else st
+            conn = get_conn(); cur = conn.cursor()
+            if st_filter:
+                cur.execute("SELECT id,title,status,due_date,progress,total_value,quantity,unit_value FROM tasks WHERE owner=? AND status=? AND title LIKE ? ORDER BY status,due_date", (owner, st_filter, f"%{termo}%"))
+            else:
+                cur.execute("SELECT id,title,status,due_date,progress,total_value,quantity,unit_value FROM tasks WHERE owner=? AND title LIKE ? ORDER BY status,due_date", (owner, f"%{termo}%"))
+            for (tid,tit,stt,pra,prog,tot,qt,unit) in cur.fetchall():
+                unit_calc = unit if unit is not None else ((tot or 0)/qt if (qt or 0) > 0 else 0)
+                total_calc = (tot if tot is not None else (qt or 0) * (unit_calc or 0))
+                tree.insert('', tk.END, iid=str(tid), values=(tid, tit, stt, pra, prog, fmt_brl(total_calc or 0), qt or 0, fmt_brl(unit_calc)))
+            conn.close()
+
+        def show_details(task_id: int):
+            t = obter_tarefa(task_id)
+            detalhes.delete("1.0", tk.END)
+            detalhes.insert(tk.END, (
+                f"ID: {t.id}\nTítulo: {t.titulo}\nDescrição: {t.descricao}\nResponsável: {t.responsavel}\n"
+                f"Prioridade: {t.prioridade}\nStatus: {t.status}\n% Conclusão: {t.conclusao}\nInício: {t.inicio}\nPrazo: {t.prazo}\nN° PPG: {t.ppg}\nPeríodo: {t.periodo}\nÁrea: {t.area}\nCC: {t.cc}\nQtde: {t.quantidade}\nUnitário: {fmt_brl(t.unitario)}\nTOTAL: {fmt_brl(t.total)}"
+            ))
+            titulo_var.set(t.titulo); desc_txt.delete("1.0", tk.END); desc_txt.insert(tk.END, t.descricao or "")
+            resp_cb.set(t.responsavel); prio_cb.set(t.prioridade or PRIORIDADES[1])
+            status_edit_cb.set(t.status); inicio_var.set(t.inicio); prazo_var.set(t.prazo)
+            total_var.set(fmt_num_brl(t.total)); qtde_var.set(str(t.quantidade or 0)); unit_var.set(fmt_num_brl(t.unitario))
+            status_quick_var.set(t.status)
+
+        def on_select(event):
+            item = tree.focus();
+            if item:
+                show_details(int(item))
+        tree.bind("<<TreeviewSelect>>", on_select)
+
+        def do_quick_status():
+            item = tree.focus();
+            if not item:
+                messagebox.showwarning("Seleção", "Selecione uma atividade."); return
+            novo = status_quick_var.get()
+            try:
+                alterar_status(int(item), novo); messagebox.showinfo("Status", f"Status alterado para: {novo}")
+                load_list(); self.refresh_board(); self.tab_kpis._render_kpis()
+            except Exception as e:
+                messagebox.showerror("Erro", f"Falha ao alterar status: {e}")
+
+        def do_save():
+            item = tree.focus();
+            if not item:
+                messagebox.showwarning("Seleção", "Selecione uma atividade."); return
+            try:
+                total_val = parse_money(total_var.get())
+                qtde_val = float(str(qtde_var.get()).replace(',', '.') or 0)
+                unit_val = parse_money(unit_var.get())
+                total_val = unit_val * qtde_val
+                atualizar_tarefa(int(item), titulo_var.get().strip(), desc_txt.get("1.0", tk.END).strip(), resp_cb.get().strip(),
+                                 prio_cb.get().strip(), status_edit_cb.get().strip(), inicio_var.get().strip(), prazo_var.get().strip(),
+                                 ppg_var.get().strip(), periodo_var.get().strip(), area_var.get().strip(), cc_var.get().strip(),
+                                 total_val, qtde_val, unit_val, progresso=None)
+                messagebox.showinfo("Salvar", "Alterações gravadas com sucesso.")
+                load_list(); self.refresh_board(); self.tab_kpis._render_kpis()
+            except Exception as e:
+                messagebox.showerror("Erro", f"Falha ao salvar: {e}")
+
+        def do_delete():
+            item = tree.focus();
+            if not item:
+                messagebox.showwarning("Seleção", "Selecione uma atividade."); return
+            if not messagebox.askyesno("Excluir", "Confirma excluir esta atividade?"):
+                return
+            try:
+                excluir_tarefa(int(item)); messagebox.showinfo("Excluir", "Atividade excluída.")
+                load_list(); self.refresh_board(); self.tab_kpis._render_kpis(); detalhes.delete("1.0", tk.END)
+            except Exception as e:
+                messagebox.showerror("Erro", f"Falha ao excluir: {e}")
+
+        def do_postponer():
+            item = tree.focus();
+            if not item:
+                messagebox.showwarning("Seleção", "Selecione uma atividade."); return
+            dias = simpledialog.askinteger("Postergar", "Quantos dias deseja adiar?", minvalue=1, initialvalue=2, parent=m)
+            if dias:
+                t = obter_tarefa(int(item)); from datetime import datetime as dt
+                novo_prazo = dt.strptime(t.prazo, "%Y-%m-%d").date() + timedelta(days=dias)
+                conn = get_conn(); cur = conn.cursor(); cur.execute("UPDATE tasks SET due_date = ? WHERE id = ?", (str(novo_prazo), int(item)))
+                conn.commit(); conn.close(); messagebox.showinfo("Postergar", f"Atividade adiada em +{dias} dia(s).")
+                load_list(); self.refresh_board(); self.tab_kpis._render_kpis()
+
+        def do_conclude():
+            item = tree.focus();
+            if not item:
+                messagebox.showwarning("Seleção", "Selecione uma atividade."); return
+            task_id = int(item); dlg = JanelaEvidencias(self, task_id); self.wait_window(dlg)
+            if dlg.result is None:
+                return
+            concluir_tarefa(task_id, dlg.result['files'], dlg.result['text'], dlg.result['link'])
+            destino = os.path.join(EVID_DIR, f"task_{task_id}"); pdf = os.path.join(destino, f"evidencia_task_{task_id}.pdf")
+            messagebox.showinfo("Concluir", f"Atividade concluída e evidência gerada:\n{pdf}")
+            load_list(); self.refresh_board(); self.tab_kpis._render_kpis()
+
+        load_list(); itens = tree.get_children()
+        if itens:
+            tree.focus(itens[0]); tree.selection_set(itens[0]); show_details(int(itens[0]))
+
+# -----------------------------
+# Aba Exportação (PDF/Excel)
+# -----------------------------
+class AbaExportacao(tk.Frame):
+    def __init__(self, master_notebook: ttk.Notebook):
+        super().__init__(master_notebook)
+        self._build()
+
+    def _build(self):
+        tk.Label(self, text="Exportação de Dados", font=("Segoe UI", 16, "bold")).pack(anchor='w', padx=12, pady=8)
+        frm = tk.Frame(self); frm.pack(fill=tk.X, padx=12, pady=6)
+        ttk.Button(frm, text="Exportar Tarefas (PDF)", command=self._exp_tarefas_pdf).pack(side=tk.LEFT, padx=6)
+        ttk.Button(frm, text="Exportar Tarefas (Excel)", command=self._exp_tarefas_xlsx).pack(side=tk.LEFT, padx=6)
+        self.status_var = tk.StringVar(value="Pronto")
+        tk.Label(self, textvariable=self.status_var).pack(anchor='w', padx=12, pady=6)
+
+    def _exp_tarefas_pdf(self):
+        try:
+            fname = exportar_tarefas_para_pdf()
+            self.status_var.set(f"Tarefas exportadas para {fname}")
+            messagebox.showinfo("Exportação", f"Arquivo gerado:\n{fname}")
+        except Exception as e:
+            messagebox.showerror("Exportação", f"Falha ao exportar PDF: {e}")
+
+    def _exp_tarefas_xlsx(self):
+        try:
+            conn = get_conn(); df = pd.read_sql_query("SELECT * FROM tasks", conn); conn.close()
+            fname = f"export_tarefas_{datetime.now().strftime('%Y%m%d_%H%M%S')}.xlsx"
+            with pd.ExcelWriter(fname, engine='openpyxl') as writer:
+                df.to_excel(writer, index=False, sheet_name='tarefas')
+            self.status_var.set(f"Tarefas exportadas para {fname}")
+            messagebox.showinfo("Exportação", f"Arquivo gerado:\n{fname}")
+        except Exception as e:
+            messagebox.showerror("Exportação", f"Falha ao exportar Excel: {e}")
+
+# -----------------------------
+# Bootstrap
+# -----------------------------
+if __name__ == "__main__":
+    ensure_schema(); app = KanbanApp(); app.mainloop()
